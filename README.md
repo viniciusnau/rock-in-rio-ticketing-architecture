@@ -54,6 +54,7 @@ flowchart TB
     EXP --> RS
     EXP --> ADM
     REC --> RS
+    REC -.-> DB
     DB -- "outbox" --> MQ
 ```
 
@@ -83,7 +84,7 @@ flowchart TB
     WHERE id = :lote_id AND vendidos + reservados + :quantidade <= total;
    INSERT INTO reserva (..., status, expira_em) VALUES (..., 'RESERVADO', now() + interval '10 minutes');
    ```
-3. Se o banco recusar, o Redis devolve o estoque. Se o serviço cair no meio, um job devolve as reservas "em trânsito" sem registro no banco.
+3. Se o banco confirmar, tira a marca de "em trânsito". Se recusar, o Redis devolve o estoque. Se o serviço cair no meio, um job devolve as reservas "em trânsito" sem registro no banco.
 
 **Estados**: toda transição é um `UPDATE ... WHERE status = <estado esperado>`, então expirador e webhook nunca agem na mesma reserva.
 
@@ -99,10 +100,12 @@ stateDiagram-v2
     Expirada --> [*]
 ```
 
-- O expirador **não toca** reservas em `Pendente`: quem paga no último segundo não perde o ingresso.
+- O expirador **não toca** reservas em `Pendente`: quem paga no último segundo não perde o ingresso. Só depois de 30 min travado ele consulta o gateway: se aprovado, vira `Vendido`; senão, cancela a autorização e expira.
+- Recusado volta para `Reservado` com pelo menos 2 min de prazo para tentar outro cartão.
 - O cartão é **autorizado** ao iniciar e **capturado** só depois de `Vendido`. Não existe "aprovado e depois estornado".
 - Pagamento com chave de idempotência: clique duplo ou webhook repetido não cobra duas vezes.
-- A expiração é decidida pelo `expira_em` no PostgreSQL. A reconciliação compara Redis e banco, descontando as reservas em trânsito.
+- A expiração é decidida pelo `expira_em` no PostgreSQL. Ao expirar, o expirador devolve o estoque no banco e no Redis e libera mais gente da fila.
+- A reconciliação compara Redis e banco, descontando as reservas em trânsito.
 
 ---
 
@@ -133,11 +136,14 @@ sequenceDiagram
     F-->>C: sua vez (token)
     C->>E: reserva
     E->>R: decrementa
-    E->>P: grava reserva
-    alt sem estoque
+    alt Redis sem estoque
+        E-->>C: esgotado
+    else banco recusa
+        E->>P: grava reserva
         E->>R: devolve
         E-->>C: esgotado
     else ok
+        E->>P: grava reserva
         E-->>C: reservado (10 min)
         C->>PG: paga
         PG->>P: Pendente
